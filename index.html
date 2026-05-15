@@ -182,8 +182,8 @@ canvas { display:block; margin:0 auto; }
     <div class="app-ver">v1.0.0 Web版</div>
   </div>
   <div class="setting-item" onclick="exportCSV()">📤 导出数据（CSV）</div>
-  <div class="setting-item" onclick="document.getElementById('wechat-file').click()">📥 导入微信账单（CSV）</div>
-  <input type="file" id="wechat-file" accept=".csv" style="display:none" onchange="importWechatCSV(this)">
+  <div class="setting-item" onclick="document.getElementById('import-file').click()">📥 导入账单（支付宝/微信 CSV）</div>
+  <input type="file" id="import-file" accept=".csv" style="display:none" onchange="importCSV(this)">
   <div class="setting-item" onclick="logout()">🚪 退出登录</div>
   <div class="setting-item danger" onclick="clearAll()">🗑️ 清除所有数据</div>
 </div>
@@ -689,7 +689,53 @@ function exportCSV() {
   URL.revokeObjectURL(a.href);
 }
 
-function importWechatCSV(input) {
+function detectCSVSource(lines) {
+  for (let i = 0; i < Math.min(lines.length, 30); i++) {
+    if (lines[i].includes('交易时间') && lines[i].includes('收/支')) return { type: 'wechat', headerIdx: i };
+    if (lines[i].includes('交易时间') && lines[i].includes('收/支') === false && lines[i].includes('交易对方')) return { type: 'alipay', headerIdx: i };
+    if (lines[i].includes('交易号') && lines[i].includes('商家订单号')) return { type: 'alipay', headerIdx: i };
+    if (lines[i].includes('交易创建时间') || (lines[i].includes('收/付款') && lines[i].includes('金额'))) return { type: 'alipay', headerIdx: i };
+  }
+  return null;
+}
+
+function parseWechatRow(cols, idx) {
+  if (idx.iStatus >= 0) {
+    const status = cols[idx.iStatus] || '';
+    if (/退款|已退|关闭|失败/.test(status)) return null;
+  }
+  const typeStr = cols[idx.iType] || '';
+  if (typeStr !== '支出' && typeStr !== '收入') return null;
+  const type = typeStr === '收入' ? 'income' : 'expense';
+  const amount = parseFloat((cols[idx.iAmount] || '').replace(/[¥￥\s]/g, ''));
+  if (isNaN(amount) || amount <= 0) return null;
+  const date = (cols[idx.iTime] || '').slice(0, 10);
+  if (!/^\d{4}[-\/]\d{2}[-\/]\d{2}$/.test(date)) return null;
+  const note = cols[idx.iGoods] || cols[idx.iTarget] || '';
+  return { type, amount, date: date.replace(/\//g, '-'), note };
+}
+
+function parseAlipayRow(cols, idx) {
+  if (idx.iStatus >= 0) {
+    const status = cols[idx.iStatus] || '';
+    if (/退款|已退|关闭|失败|冻结/.test(status)) return null;
+  }
+  const typeStr = cols[idx.iType] || '';
+  let type;
+  if (typeStr === '支出' || typeStr === '付款') type = 'expense';
+  else if (typeStr === '收入' || typeStr === '收款') type = 'income';
+  else if (typeStr.includes('支出') || typeStr.includes('付')) type = 'expense';
+  else if (typeStr.includes('收入') || typeStr.includes('收')) type = 'income';
+  else return null;
+  const amount = parseFloat((cols[idx.iAmount] || '').replace(/[¥￥\s]/g, ''));
+  if (isNaN(amount) || amount <= 0) return null;
+  const date = (cols[idx.iTime] || '').slice(0, 10);
+  if (!/^\d{4}[-\/]\d{2}[-\/]\d{2}$/.test(date)) return null;
+  const note = cols[idx.iGoods] || cols[idx.iTarget] || '';
+  return { type, amount, date: date.replace(/\//g, '-'), note };
+}
+
+function importCSV(input) {
   const file = input.files[0];
   if (!file) return;
   const reader = new FileReader();
@@ -697,62 +743,40 @@ function importWechatCSV(input) {
     try {
       const text = e.target.result;
       const lines = text.split('\n').map(l => l.trim()).filter(l => l);
-      // 找到表头行
-      let headerIdx = -1;
-      for (let i = 0; i < Math.min(lines.length, 30); i++) {
-        if (lines[i].includes('交易时间') && lines[i].includes('收/支')) {
-          headerIdx = i; break;
-        }
-      }
-      if (headerIdx === -1) { alert('无法识别微信账单格式，请确认是从微信导出的 CSV 文件'); return; }
+      const detected = detectCSVSource(lines);
+      if (!detected) { alert('无法识别账单格式，请确认是从微信或支付宝导出的 CSV 文件'); return; }
 
-      const headers = lines[headerIdx].split(',').map(h => h.replace(/"/g,'').trim());
-      const iTime = headers.indexOf('交易时间');
-      const iType = headers.findIndex(h => h.includes('收/支'));
-      const iTarget = headers.findIndex(h => h.includes('交易对方'));
-      const iGoods = headers.findIndex(h => h.includes('商品'));
-      const iAmount = headers.findIndex(h => h.includes('金额'));
-      const iStatus = headers.findIndex(h => h.includes('当前状态'));
+      const headers = lines[detected.headerIdx].split(',').map(h => h.replace(/"/g,'').trim());
+      const find = (keywords) => headers.findIndex(h => keywords.some(k => h.includes(k)));
+
+      const idx = {
+        iTime: find(['交易时间','交易创建时间','创建时间']),
+        iType: find(['收/支','收/付款','收/付','资金状态']),
+        iTarget: find(['交易对方','对方']),
+        iGoods: find(['商品','商品说明','商品名称']),
+        iAmount: find(['金额','金额（元）']),
+        iStatus: find(['当前状态','交易状态','状态']),
+      };
 
       const txns = loadTxns();
       let maxId = txns.length ? Math.max(...txns.map(t => t.id)) : 0;
       let imported = 0, skipped = 0;
+      const parser = detected.type === 'wechat' ? parseWechatRow : parseAlipayRow;
 
-      for (let i = headerIdx + 1; i < lines.length; i++) {
+      for (let i = detected.headerIdx + 1; i < lines.length; i++) {
         const cols = lines[i].split(',').map(c => c.replace(/"/g,'').trim());
         if (cols.length < 5) continue;
-
-        // 跳过非成功交易
-        if (iStatus >= 0) {
-          const status = cols[iStatus] || '';
-          if (status.includes('退款') || status.includes('已退') || status.includes('关闭') || status.includes('失败')) { skipped++; continue; }
-        }
-
-        const typeStr = cols[iType] || '';
-        if (typeStr !== '支出' && typeStr !== '收入') { skipped++; continue; }
-
-        const type = typeStr === '收入' ? 'income' : 'expense';
-        const amountStr = (cols[iAmount] || '').replace(/[¥￥\s]/g, '');
-        const amount = parseFloat(amountStr);
-        if (isNaN(amount) || amount <= 0) { skipped++; continue; }
-
-        const timeStr = cols[iTime] || '';
-        const date = timeStr.slice(0, 10);
-        if (!/^\d{4}[-\/]\d{2}[-\/]\d{2}$/.test(date)) { skipped++; continue; }
-
-        const target = cols[iTarget] || '';
-        const goods = cols[iGoods] || '';
-        const note = goods || target;
-
-        const cat = classify(note) || (type === 'income' ? getIncomeCats()[0] : getExpenseCats()[0]);
-
+        const row = parser(cols, idx);
+        if (!row) { skipped++; continue; }
+        const cat = classify(row.note) || (row.type === 'income' ? getIncomeCats()[0] : getExpenseCats()[0]);
         maxId++;
-        txns.push({ id: maxId, amount, type, category: cat, note, date: date.replace(/\//g, '-') });
+        txns.push({ id: maxId, amount: row.amount, type: row.type, category: cat, note: row.note, date: row.date });
         imported++;
       }
 
       saveTxns(txns);
-      alert(`导入完成！\n成功：${imported} 条\n跳过：${skipped} 条（退款/非收支/格式异常）`);
+      const sourceName = detected.type === 'wechat' ? '微信' : '支付宝';
+      alert(`已识别为${sourceName}账单，导入完成！\n成功：${imported} 条\n跳过：${skipped} 条（退款/非收支/格式异常）`);
       input.value = '';
       switchTab('home');
     } catch (err) {
