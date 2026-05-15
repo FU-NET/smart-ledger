@@ -182,6 +182,8 @@ canvas { display:block; margin:0 auto; }
     <div class="app-ver">v1.0.0 Web版</div>
   </div>
   <div class="setting-item" onclick="exportCSV()">📤 导出数据（CSV）</div>
+  <div class="setting-item" onclick="document.getElementById('wechat-file').click()">📥 导入微信账单（CSV）</div>
+  <input type="file" id="wechat-file" accept=".csv" style="display:none" onchange="importWechatCSV(this)">
   <div class="setting-item" onclick="logout()">🚪 退出登录</div>
   <div class="setting-item danger" onclick="clearAll()">🗑️ 清除所有数据</div>
 </div>
@@ -685,6 +687,79 @@ function exportCSV() {
   a.download = 'smartledger_'+today()+'.csv';
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+function importWechatCSV(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const text = e.target.result;
+      const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+      // 找到表头行
+      let headerIdx = -1;
+      for (let i = 0; i < Math.min(lines.length, 30); i++) {
+        if (lines[i].includes('交易时间') && lines[i].includes('收/支')) {
+          headerIdx = i; break;
+        }
+      }
+      if (headerIdx === -1) { alert('无法识别微信账单格式，请确认是从微信导出的 CSV 文件'); return; }
+
+      const headers = lines[headerIdx].split(',').map(h => h.replace(/"/g,'').trim());
+      const iTime = headers.indexOf('交易时间');
+      const iType = headers.findIndex(h => h.includes('收/支'));
+      const iTarget = headers.findIndex(h => h.includes('交易对方'));
+      const iGoods = headers.findIndex(h => h.includes('商品'));
+      const iAmount = headers.findIndex(h => h.includes('金额'));
+      const iStatus = headers.findIndex(h => h.includes('当前状态'));
+
+      const txns = loadTxns();
+      let maxId = txns.length ? Math.max(...txns.map(t => t.id)) : 0;
+      let imported = 0, skipped = 0;
+
+      for (let i = headerIdx + 1; i < lines.length; i++) {
+        const cols = lines[i].split(',').map(c => c.replace(/"/g,'').trim());
+        if (cols.length < 5) continue;
+
+        // 跳过非成功交易
+        if (iStatus >= 0) {
+          const status = cols[iStatus] || '';
+          if (status.includes('退款') || status.includes('已退') || status.includes('关闭') || status.includes('失败')) { skipped++; continue; }
+        }
+
+        const typeStr = cols[iType] || '';
+        if (typeStr !== '支出' && typeStr !== '收入') { skipped++; continue; }
+
+        const type = typeStr === '收入' ? 'income' : 'expense';
+        const amountStr = (cols[iAmount] || '').replace(/[¥￥\s]/g, '');
+        const amount = parseFloat(amountStr);
+        if (isNaN(amount) || amount <= 0) { skipped++; continue; }
+
+        const timeStr = cols[iTime] || '';
+        const date = timeStr.slice(0, 10);
+        if (!/^\d{4}[-\/]\d{2}[-\/]\d{2}$/.test(date)) { skipped++; continue; }
+
+        const target = cols[iTarget] || '';
+        const goods = cols[iGoods] || '';
+        const note = goods || target;
+
+        const cat = classify(note) || (type === 'income' ? getIncomeCats()[0] : getExpenseCats()[0]);
+
+        maxId++;
+        txns.push({ id: maxId, amount, type, category: cat, note, date: date.replace(/\//g, '-') });
+        imported++;
+      }
+
+      saveTxns(txns);
+      alert(`导入完成！\n成功：${imported} 条\n跳过：${skipped} 条（退款/非收支/格式异常）`);
+      input.value = '';
+      switchTab('home');
+    } catch (err) {
+      alert('导入失败：' + err.message);
+    }
+  };
+  reader.readAsText(file, 'UTF-8');
 }
 
 function clearAll() {
